@@ -4,6 +4,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include "threadPool.h"
 
 struct SockInfo
 {
@@ -11,9 +12,14 @@ struct SockInfo
 	int fd;
 };
 
-struct SockInfo infos[512];
+typedef struct PoolInfo
+{
+	ThreadPool *p;
+	int fd;
+} PoolInfo;
 
-void *working(void *arg);
+void working(void *arg);
+void acceptConn(void *arg);
 
 int main()
 {
@@ -49,48 +55,44 @@ int main()
 		return -1;
 	}
 
-	// 初始化结构体数组
-	int max = sizeof(infos) / sizeof(infos[0]);
-	for (int i = 0; i < max; ++i)
-	{
-		bzero(&infos[i], sizeof(infos[i]));
-		// or memset(&infos[i], 0, sizeof(infos[i]));
-		infos[i].fd = -1;
-	}
+	// 创建线程池
+	ThreadPool *pool = threadPoolCreate(3, 8, 100);
+	PoolInfo *info = (PoolInfo *)malloc(sizeof(PoolInfo));
+	info->p = pool;
+	info->fd = fd;
+	threadPoolAdd(pool, acceptConn, info);
 
+	pthread_exit(NULL);
+
+	return 0;
+}
+
+void acceptConn(void *arg)
+{
+	PoolInfo *poolInfo = (PoolInfo *)arg;
 	// 阻塞并等待客户端的连接
-	int addrlen = sizeof(infos[0].addr);
-	// or struct sockaddr_in
+	int addrlen = sizeof(struct sockaddr_in);
 
 	while (1)
 	{
-		struct SockInfo *pinfo;
-		for (int i = 0; i < max; i++)
-		{
-			if (infos[i].fd == -1)
-			{
-				pinfo = &infos[i];
-				break;
-			}
-		}
-		int cfd = accept(fd, (struct sockaddr *)&pinfo->addr, &addrlen);
-		if (cfd == -1)
+		struct SockInfo *pinfo = (struct SockInfo *)malloc(sizeof(struct SockInfo));
+
+		pinfo->fd = accept(poolInfo->fd, (struct sockaddr *)&pinfo->addr, &addrlen);
+
+		if (pinfo->fd == -1)
 		{
 			perror("accept");
 			break;
 		}
-		pinfo->fd = cfd;
-		// 创建子线程
-		pthread_t tid;
-		pthread_create(&tid, NULL, working, pinfo);
-		pthread_detach(tid);
+
+		// 添加通信的任务
+		threadPoolAdd(poolInfo->p, working, pinfo);
 	}
 
-	close(fd);
-	return 0;
+	close(poolInfo->fd);
 }
 
-void *working(void *arg)
+void working(void *arg)
 {
 	struct SockInfo *pinfo = (struct SockInfo *)arg;
 	// 连接建立成功，打印客户端的IP和端口信息
@@ -125,7 +127,4 @@ void *working(void *arg)
 
 	// 关闭文件描述符
 	close(pinfo->fd);
-	pinfo->fd = -1;
-
-	return NULL;
 }

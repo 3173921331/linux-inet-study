@@ -34,7 +34,7 @@ int main()
 	{
 		// 发送
 		char buff[1024];
-		sprintf(buff, "你好, hello, world, %d...\n", number++);
+		scanf("%s", buff);
 		send(fd, buff, strlen(buff) + 1, 0);
 
 		// 接收数据
@@ -56,7 +56,7 @@ int main()
 			break;
 		}
 		sleep(1);
-		}
+	}
 
 	// 关闭文件描述符
 	close(fd);

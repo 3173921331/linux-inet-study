@@ -66,7 +66,7 @@ void *communication(void *arg)
     printf("after buf = %s\n", buf);
 
     // 大写串发给客户端
-    int ret = send(info->fd, buf, strlen(buf) + 1, 0);
+    int ret = send(info->fd, buf, strlen(buf), 0);
     if (ret == -1)
     {
         perror("send error");

@@ -22,7 +22,6 @@ void *parseRecvMessage(void *arg)
         {
             if(ret == 0)
             {
-                printf("服务端已经断开了连接...\n");
                 exit(0);
             }
             continue;

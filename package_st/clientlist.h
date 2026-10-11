@@ -9,6 +9,7 @@ struct ClientInfo
     int count;
     pthread_t tid;
     int dead;
+    struct ClientInfo *head;
     struct ClientInfo *next;
 };
 

@@ -15,6 +15,8 @@ struct ClientInfo *prependNode(struct ClientInfo *head, int fd)
     struct ClientInfo *node = (struct ClientInfo *)malloc(sizeof(struct ClientInfo));
     node->fd = fd;
     node->count = 0;
+    node->dead = 0;
+    node->head = head;
     node->next = head->next;
     head->next = node;
     return node;

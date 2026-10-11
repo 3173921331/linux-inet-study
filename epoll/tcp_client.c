@@ -29,12 +29,12 @@ int main()
 	}
 
 	int number = 0;
+	char buff[1024];
 	// 通信
 	while (1)
 	{
 		// 发送
-		char buff[1024];
-		scanf("%s", buff);
+		sprintf(buff, "hello, world, %d...\n", number++);
 		send(fd, buff, strlen(buff) + 1, 0);
 
 		// 接收数据
@@ -55,7 +55,7 @@ int main()
 			perror("recv");
 			break;
 		}
-		sleep(1);
+		usleep(100000);
 	}
 
 	// 关闭文件描述符

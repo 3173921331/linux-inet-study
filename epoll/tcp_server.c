@@ -7,6 +7,80 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
+
+typedef struct socketinfo
+{
+    int fd;
+    int epfd;
+} SocketInfo;
+
+void *acceptConn(void *arg)
+{
+    printf("acceptconn tid: %ld\n", pthread_self());
+    struct epoll_event ev;
+    SocketInfo *info = (SocketInfo *)arg;
+    int cfd = accept(info->fd, NULL, NULL);
+    // 设置非阻塞属性
+    int flag = fcntl(cfd, F_GETFL);
+    flag |= O_NONBLOCK;
+    fcntl(cfd, F_SETFL, flag);
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = cfd;
+    epoll_ctl(info->epfd, EPOLL_CTL_ADD, cfd, &ev);
+
+    free(info);
+    return NULL;
+}
+
+void *communication(void *arg)
+{
+    printf("communication tid: %ld\n", pthread_self());
+    SocketInfo *info = (SocketInfo *)arg;
+    int fd = info->fd;
+    int epfd = info->epfd;
+    char buf[6];
+    char temp[1024];
+    bzero(temp, sizeof(temp));
+    while (1)
+    {
+        int len = recv(fd, buf, sizeof(buf) - 1, 0);
+
+        if (len == -1)
+        {
+            if (errno == EAGAIN)
+            {
+                printf("数据已经接受完毕...\n");
+                printf("after buf = %s\n", temp);
+                send(fd, temp, strlen(temp) + 1, 0);
+                break;
+            }
+            else
+            {
+                perror("recv error");
+                break;
+            }
+        }
+        else if (len == 0)
+        {
+            printf("客户端已经断开了连接...\n");
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            break;
+        }
+        buf[len] = '\0';
+        printf("read buf = %s\n", buf);
+        // 小写转大写
+        for (int j = 0; j < len; ++j)
+        {
+            buf[j] = toupper(buf[j]);
+        }
+        strncat(temp + strlen(temp), buf, len);
+    }
+
+    free(info);
+    return NULL;
+}
 
 int main()
 {
@@ -64,63 +138,22 @@ int main()
     {
         int num = epoll_wait(epfd, evs, size, -1);
         printf("num = %d\n", num);
+        pthread_t tid;
         for (int i = 0; i < num; ++i)
         {
             int fd = evs[i].data.fd;
+            SocketInfo *info = (SocketInfo *)malloc(sizeof(SocketInfo));
+            info->fd = fd;
+            info->epfd = epfd;
             if (fd == lfd)
             {
-                int cfd = accept(fd, NULL, NULL);
-                // 设置非阻塞属性
-                int flag = fcntl(cfd, F_GETFL);
-                flag |= O_NONBLOCK;
-                fcntl(cfd, F_SETFL, flag);
-                ev.events = EPOLLIN | EPOLLET;
-                ev.data.fd = cfd;
-                epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
+                pthread_create(&tid, NULL, acceptConn, info);
+                pthread_detach(tid);
             }
             else
             {
-                // 接收数据
-                char buf[5];
-                while (1)
-                {
-                    int len = recv(fd, buf, sizeof(buf), 0);
-
-                    if (len == -1)
-                    {
-                        if (errno == EAGAIN)
-                        {
-                            printf("数据已经接受完毕...\n");
-                            break;
-                        }
-                        perror("recv error");
-                        exit(1);
-                    }
-                    else if (len == 0)
-                    {
-                        printf("客户端已经断开了连接...\n");
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                        close(fd);
-                        break;
-                    }
-
-                    printf("read buf = %s\n", buf);
-                    // 小写转大写
-                    for (int j = 0; j < len; ++j)
-                    {
-                        buf[j] = toupper(buf[j]);
-                    }
-                    write(STDOUT_FILENO, buf, len);
-                    // printf("after buf = %s\n", buf);
-
-                    // // 大写串发给客户端
-                    ret = send(fd, buf, strlen(buf) + 1, 0);
-                    if (ret == -1)
-                    {
-                        perror("send error");
-                        exit(1);
-                    }
-                }
+                pthread_create(&tid, NULL, communication, info);
+                pthread_detach(tid);
             }
         }
         sleep(1);
@@ -131,3 +164,5 @@ int main()
 
     return 0;
 }
+
+// epoll内部函数是线程安全，所以不需要考虑线程安全问题，直接使用即可，如果有其他信息修改还是需要加锁

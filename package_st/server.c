@@ -1,7 +1,7 @@
 #include "socket.h"
 #include "clientlist.h"
 #include <pthread.h>
-#include<unistd.h>
+#include <unistd.h>
 
 pthread_mutex_t mtx;
 
@@ -16,6 +16,10 @@ void *parseRecvMessage(void *arg)
         if (buffer == NULL)
         {
             printf("fd = %d, 通信的子线程退出了...\n", info->fd);
+            // 接收线程自己删除自己的节点，释放内存
+            pthread_mutex_lock(&mtx);
+            removeNode(info, info->fd);
+            pthread_mutex_unlock(&mtx);
             pthread_exit(NULL);
         }
         else
@@ -51,10 +55,8 @@ void *heartBeat(void *arg)
     {
         pthread_mutex_lock(&mtx);
         p = head->next;
-        pthread_mutex_unlock(&mtx);
         while (p)
         {
-            pthread_mutex_lock(&mtx);
             nxp = p->next;
             p->count++; // 默认没收到服务器回复的心跳包数据
             printf("fd = %d, count = %d\n", p->fd, p->count);
@@ -64,12 +66,11 @@ void *heartBeat(void *arg)
                 printf("客户端 fd = %d, 客户端和服务器断开了连接...\n", p->fd);
                 close(p->fd);
                 // 释放套接字资源，退出客户端程序
-                pthread_cancel(p->tid);
-                removeNode(head, p->fd);
+                // pthread_cancel(p->tid);这个释放会导致如果接收线程时先退出的，这个线程号会分配给新的线程，然后心跳超时后会把这个分配给新线程的tid号也销毁导致连带销毁，所以把节点资源释放交给接收程序
             }
-            pthread_mutex_unlock(&mtx);
             p = nxp;
         }
+        pthread_mutex_unlock(&mtx);
         sleep(3);
     }
     return NULL;

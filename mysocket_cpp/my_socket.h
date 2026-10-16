@@ -5,6 +5,9 @@
 #include <unordered_map>
 #include <memory>
 #include <chrono>
+#include <queue>
+#include <mutex>
+#include <memory>
 
 inline constexpr int MAX_MSG_SIZE = 10 * 1024;
 
@@ -21,13 +24,22 @@ struct Connection
 {
     explicit Connection(int f) : fd(f) {}
     int fd;
-    std::string recvBuf;    // 已收但未解析的字节
-    std::string sendBuf;    // 待发送的字节
-    bool needClose = false; // 标记待关闭
+    std::string recvBuf; // 已收但未解析的字节
+    std::string sendBuf; // 待发送的字节
     // 后面加：lastActiveTime、heartbeatCount 等
 };
 
+struct Result
+{
+    std::weak_ptr<Connection> conn;
+    std::string data;
+};
+
 extern std::unordered_map<int, std::shared_ptr<Connection>> connMap;
+
+extern int wakeupFd; // eventfd
+extern std::queue<Result> resultQueue;
+extern std::mutex resultMtx;
 
 // 设置非阻塞
 inline void setNonBlock(int &fd)
@@ -76,11 +88,13 @@ void disableWrite(int fd, int epfd);
 // 获取ConnMap实例
 std::shared_ptr<Connection> getConn(int fd);
 
-// 发送数据
-void sendToConn(int epfd, int fd, const std::string &buffer, Type t);
+// 工作者线程函数
+void worker(std::weak_ptr<Connection> conn, std::string info, Type t);
+
+// 发送已经打包好的数据
+void flushToConn(int epfd, int fd, const std::string &buffer);
 
 // 循环读
 void handleRead(int epfd, int fd);
 
-// 循环写
 void handleWrite(int epfd, int fd);

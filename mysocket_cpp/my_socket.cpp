@@ -1,4 +1,5 @@
 #include "my_socket.h"
+#include "ThreadPool.h"
 #include <cstring>
 #include <unistd.h>
 #include <cstdio>
@@ -6,6 +7,13 @@
 #include <sys/epoll.h>
 
 std::unordered_map<int, std::shared_ptr<Connection>> connMap;
+
+std::queue<Result> resultQueue;
+std::mutex resultMtx;
+
+int wakeupFd = -1; // eventfd
+
+ThreadPool pool(4); // 线程池
 
 int initSocket()
 {
@@ -303,47 +311,64 @@ std::shared_ptr<Connection> getConn(int fd)
     return it->second;
 }
 
-void sendToConn(int epfd, int fd, const std::string &buffer, Type t)
+void worker(std::weak_ptr<Connection> conn, std::string info, Type t)
 {
-    auto conn = getConn(fd);
-    if (!conn)
-        return;
     // 组包
     std::string pkt;
-    int len = buffer.size();
+    int len = info.size();
     uint32_t pkgLen = len + 1 + sizeof(int);
     pkt.reserve(pkgLen);
     uint32_t netlen = htonl(len + 1);
     pkt.append((char *)(&netlen), sizeof(netlen));
     pkt += t == Type::Heart ? 'H' : 'M';
-    pkt.append(buffer.data(), len);
+    pkt.append(info.data(), len);
+
+    {
+        std::unique_lock<std::mutex> lock(resultMtx);
+        resultQueue.push({conn, std::move(pkt)});
+    }
+    uint64_t one = 1;
+    write(wakeupFd, &one, sizeof(one));
+}
+
+void flushToConn(int epfd, int fd, const std::string &buffer)
+{
+    auto conn = getConn(fd);
+    if (!conn)
+        return;
 
     // 如果 sendBuf 非空，说明还有数据没发完，直接追加
     if (!conn->sendBuf.empty())
     {
-        conn->sendBuf.append(pkt);
+        conn->sendBuf.append(buffer);
+        enableWrite(epfd, fd);
         return;
     }
 
     // 尝试直接发送
-    int num = send(fd, pkt.data(), pkt.size(), 0);
+    printf("发送数据\n");
+    int num = send(fd, buffer.data(), buffer.size(), 0);
     if (num == -1)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            conn->sendBuf.append(pkt);
+            conn->sendBuf.append(buffer);
             enableWrite(epfd, fd);
+            return;
         }
-        else if (errno != EINTR)
+        else if (errno == EINTR)
         {
-            // 错误，标记关闭
-            conn->needClose = 1;
+            return;
         }
+        perror("send");
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        connMap.erase(fd);
         return;
     }
-    if ((size_t)num < pkt.size())
+    if ((size_t)num < buffer.size())
     {
-        conn->sendBuf.append(pkt.data() + num, pkt.size() - num);
+        conn->sendBuf.append(buffer.data() + num, buffer.size() - num);
         enableWrite(epfd, fd);
     }
     // n == pkt.size() 表示一次发完，不用注册 EPOLLOUT
@@ -413,15 +438,9 @@ void handleRead(int epfd, int fd)
 
         // 业务处理
         printf("收到数据： %.*s\n", (int)info.size(), info.data());
-        sendToConn(epfd, fd, info, t);
-        if (conn->needClose)
-        {
-            printf("对方已经关闭连接...\n");
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-            close(fd);
-            connMap.erase(fd);
-            return;
-        }
+        std::weak_ptr<Connection> wconn = conn;
+        pool.enqueue([wconn, info, t]()
+                     { worker(wconn, info, t); });
     }
 }
 
@@ -432,6 +451,7 @@ void handleWrite(int epfd, int fd)
         return;
     while (!conn->sendBuf.empty())
     {
+        printf("发送数据\n");
         int n = send(fd, conn->sendBuf.data(), conn->sendBuf.size(), 0);
         if (n > 0)
         {

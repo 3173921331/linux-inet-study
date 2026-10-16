@@ -1,9 +1,8 @@
 #include "my_socket.h"
 #include <unistd.h>
 #include <sys/epoll.h>
-#include <memory>
 #include <cstring>
-
+#include <sys/eventfd.h>
 
 int main()
 {
@@ -30,6 +29,16 @@ int main()
     ev.data.fd = lfd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev);
 
+    wakeupFd = eventfd(0, EFD_NONBLOCK);
+    if (wakeupFd == -1)
+    {
+        perror("eventfd");
+        return -1;
+    }
+    ev.events = EPOLLIN;
+    ev.data.fd = wakeupFd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, wakeupFd, &ev);
+
     epoll_event evs[1024];
     int size = sizeof(evs) / sizeof(evs[0]);
 
@@ -50,7 +59,22 @@ int main()
         {
             int fd = evs[i].data.fd;
             uint32_t events = evs[i].events;
-            if (fd == lfd)
+            if (fd == wakeupFd)
+            {
+                uint64_t val;
+                read(wakeupFd, &val, sizeof(val));
+                std::unique_lock<std::mutex> lock(resultMtx);
+                while (!resultQueue.empty())
+                {
+                    Result r = std::move(resultQueue.front());
+                    resultQueue.pop();
+                    auto c = r.conn.lock();
+                    if (!c)
+                        continue; // 连接已销毁，丢弃
+                    flushToConn(epfd, c->fd, r.data);
+                }
+            }
+            else if (fd == lfd)
             {
                 handleAccept(epfd, lfd);
             }
@@ -74,6 +98,8 @@ int main()
     }
 
     close(lfd);
+    close(wakeupFd);
+    close(epfd);
 
     return 0;
 }

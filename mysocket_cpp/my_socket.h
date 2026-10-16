@@ -1,6 +1,10 @@
 #pragma once
 #include <arpa/inet.h>
 #include <string>
+#include <fcntl.h>
+#include <unordered_map>
+#include <memory>
+#include <chrono>
 
 inline constexpr int MAX_MSG_SIZE = 10 * 1024;
 
@@ -12,6 +16,25 @@ enum class Type
 };
 // 数据包类型：'H'：心跳包，'M'：数据包
 // 数据包格式：数据长度|数据包类型|数据块
+
+struct Connection
+{
+    explicit Connection(int f) : fd(f) {}
+    int fd;
+    std::string recvBuf;    // 已收但未解析的字节
+    std::string sendBuf;    // 待发送的字节
+    bool needClose = false; // 标记待关闭
+    // 后面加：lastActiveTime、heartbeatCount 等
+};
+
+extern std::unordered_map<int, std::shared_ptr<Connection>> connMap;
+
+// 设置非阻塞
+inline void setNonBlock(int &fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
 // 初始化一个套接字
 int initSocket();
@@ -25,6 +48,8 @@ int setListen(int lfd, unsigned short port);
 // 接收客户端连接
 int acceptConnect(int lfd);
 int acceptConnect(int lfd, sockaddr &addr);
+// 循环接收客户端连接
+void handleAccept(int epfd, int lfd);
 
 // 连接到服务器
 int connectToHost(int fd, unsigned short port, const std::string &ip);
@@ -41,3 +66,21 @@ bool sendMsg(int fd, const std::string &buffer, int length, Type t);
 // 接收数据
 // 返回：>0 消息体长度；0 对端关闭；-1 系统调用错误；-2 协议错误
 int recvMsg(int fd, std::string &buffer, Type &t);
+
+// 添加EPOLLOUT
+void enableWrite(int fd, int epfd);
+
+// 取消EPOLLOUT
+void disableWrite(int fd, int epfd);
+
+// 获取ConnMap实例
+std::shared_ptr<Connection> getConn(int fd);
+
+// 发送数据
+void sendToConn(int epfd, int fd, const std::string &buffer, Type t);
+
+// 循环读
+void handleRead(int epfd, int fd);
+
+// 循环写
+void handleWrite(int epfd, int fd);

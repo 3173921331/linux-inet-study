@@ -7,7 +7,7 @@ int main()
     int fd = initSocket();
     sockaddr addr;
     unsigned short port = 8888;
-    const std::string ip = "127.0.0.1";
+    const std::string ip = "192.168.116.130";
 
     if (connectToHost(fd, port, ip) == -1)
     {

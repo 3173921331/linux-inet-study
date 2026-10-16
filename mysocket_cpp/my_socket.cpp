@@ -2,7 +2,10 @@
 #include <cstring>
 #include <unistd.h>
 #include <cstdio>
-#include<climits>
+#include <climits>
+#include <sys/epoll.h>
+
+std::unordered_map<int, std::shared_ptr<Connection>> connMap;
 
 int initSocket()
 {
@@ -76,6 +79,53 @@ int acceptConnect(int lfd, sockaddr &addr)
     return cfd;
 }
 
+void handleAccept(int epfd, int lfd)
+{
+    while (1)
+    {
+        sockaddr addr;
+        int cfd;
+        socklen_t len = sizeof(sockaddr);
+        cfd = accept(lfd, &addr, &len);
+        if (cfd == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // 没有连接了
+                break;
+            }
+            if (errno == EINTR)
+            {
+                // 被中断
+                continue;
+            }
+            else if (errno == EMFILE || errno == ENFILE)
+            {
+                // fd 耗尽
+                printf("fd limit\n");
+                break;
+            }
+            break;
+        }
+        setNonBlock(cfd);
+
+        connMap.emplace(cfd, std::make_shared<Connection>(cfd));
+
+        std::string ip(INET_ADDRSTRLEN, '\0');
+        printf("已连接到客户端 ip: %s, 端口: %d, 目前已连接客户端 %d 个\n", inet_ntop(AF_INET, &((sockaddr_in *)&addr)->sin_addr, ip.data(), ip.size()), ntohs(((sockaddr_in *)&addr)->sin_port), (int)connMap.size());
+
+        epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = cfd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1)
+        {
+            perror("epoll_ctl ADD");
+            close(cfd);
+            connMap.erase(cfd);
+        }
+    }
+}
+
 int connectToHost(int fd, unsigned short port, const std::string &ip)
 {
     sockaddr addr;
@@ -110,9 +160,14 @@ int readn(int fd, std::string &buffer, int size)
             if (errno == EINTR)
                 // 被信号打断，不算失败，继续循环读取
                 continue;
+            else if (errno == EAGAIN)
+            {
+                // 没有更多数据，返回已读部分，交给调用者决定
+                buffer.resize(readBytes);
+                return readBytes;
+            }
             else
             {
-
                 perror("readn");
                 return -1;
             }
@@ -144,6 +199,10 @@ int writen(int fd, const std::string &buffer, int length)
         {
             if (errno == EINTR)
                 continue;
+            else if (errno == EAGAIN)
+            {
+                continue;
+            }
             else
             {
                 perror("writen");
@@ -210,4 +269,190 @@ int recvMsg(int fd, std::string &buffer, Type &t)
 
     ret = readn(fd, buffer, netLen - 1);
     return ret;
+}
+
+// 添加EPOLLOUT
+void enableWrite(int fd, int epfd)
+{
+    epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1)
+    {
+        perror("epoll_ctl MOD");
+    }
+}
+
+// 取消EPOLLOUT
+void disableWrite(int fd, int epfd)
+{
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1)
+    {
+        perror("epoll_ctl MOD");
+    }
+}
+
+std::shared_ptr<Connection> getConn(int fd)
+{
+    auto it = connMap.find(fd);
+    if (it == connMap.end())
+        return nullptr;
+    return it->second;
+}
+
+void sendToConn(int epfd, int fd, const std::string &buffer, Type t)
+{
+    auto conn = getConn(fd);
+    if (!conn)
+        return;
+    // 组包
+    std::string pkt;
+    int len = buffer.size();
+    uint32_t pkgLen = len + 1 + sizeof(int);
+    pkt.reserve(pkgLen);
+    uint32_t netlen = htonl(len + 1);
+    pkt.append((char *)(&netlen), sizeof(netlen));
+    pkt += t == Type::Heart ? 'H' : 'M';
+    pkt.append(buffer.data(), len);
+
+    // 如果 sendBuf 非空，说明还有数据没发完，直接追加
+    if (!conn->sendBuf.empty())
+    {
+        conn->sendBuf.append(pkt);
+        return;
+    }
+
+    // 尝试直接发送
+    int num = send(fd, pkt.data(), pkt.size(), 0);
+    if (num == -1)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            conn->sendBuf.append(pkt);
+            enableWrite(epfd, fd);
+        }
+        else if (errno != EINTR)
+        {
+            // 错误，标记关闭
+            conn->needClose = 1;
+        }
+        return;
+    }
+    if ((size_t)num < pkt.size())
+    {
+        conn->sendBuf.append(pkt.data() + num, pkt.size() - num);
+        enableWrite(epfd, fd);
+    }
+    // n == pkt.size() 表示一次发完，不用注册 EPOLLOUT
+}
+
+void handleRead(int epfd, int fd)
+{
+    auto conn = getConn(fd);
+    if (!conn)
+        return;
+    char tmp[4096];
+    // 循环读取缓冲区
+    while (1)
+    {
+        int num = recv(fd, tmp, sizeof(tmp), 0);
+        if (num > 0)
+        {
+            conn->recvBuf.append(tmp, num);
+            continue;
+        }
+        if (num == 0)
+        {
+            printf("对方关闭了连接...\n");
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            connMap.erase(fd);
+            return;
+        }
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        perror("recv");
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        connMap.erase(fd);
+        return;
+    }
+
+    // 读完从recvBuf里解析完整包
+    while (1)
+    {
+        if (conn->recvBuf.size() < 4)
+            break;
+        uint32_t netLen;
+        memcpy(&netLen, conn->recvBuf.data(), 4);
+        netLen = ntohl(netLen);
+
+        if (netLen < 1 || netLen > MAX_MSG_SIZE)
+        {
+            printf("fd = %d 协议错误 netLen = %u\n", fd, netLen);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            connMap.erase(fd);
+            return;
+        }
+
+        uint32_t totalLen = 4 + netLen;
+        // 没接收完整包,break下次重新处理
+        if (conn->recvBuf.size() < totalLen)
+            break;
+
+        // 接收了完整包
+        Type t = conn->recvBuf[4] == 'H' ? Type::Heart : Type::Message;
+        std::string info = conn->recvBuf.substr(5, netLen - 1);
+        conn->recvBuf.erase(0, totalLen);
+
+        // 业务处理
+        printf("收到数据： %.*s\n", (int)info.size(), info.data());
+        sendToConn(epfd, fd, info, t);
+        if (conn->needClose)
+        {
+            printf("对方已经关闭连接...\n");
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            connMap.erase(fd);
+            return;
+        }
+    }
+}
+
+void handleWrite(int epfd, int fd)
+{
+    auto conn = getConn(fd);
+    if (!conn)
+        return;
+    while (!conn->sendBuf.empty())
+    {
+        int n = send(fd, conn->sendBuf.data(), conn->sendBuf.size(), 0);
+        if (n > 0)
+        {
+            conn->sendBuf.erase(0, n);
+            continue;
+        }
+        if (n == -1)
+        {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return; // 等下次
+            perror("send");
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            connMap.erase(fd);
+            return;
+        }
+        if (n == 0)
+            return;
+    }
+    // 发完了，取消 EPOLLOUT
+    disableWrite(epfd, fd);
 }

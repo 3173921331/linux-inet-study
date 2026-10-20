@@ -279,7 +279,6 @@ int recvMsg(int fd, std::string &buffer, Type &t)
     return ret;
 }
 
-// 添加EPOLLOUT
 void enableWrite(int fd, int epfd)
 {
     epoll_event ev;
@@ -291,7 +290,6 @@ void enableWrite(int fd, int epfd)
     }
 }
 
-// 取消EPOLLOUT
 void disableWrite(int fd, int epfd)
 {
     epoll_event ev;
@@ -324,10 +322,12 @@ void worker(std::weak_ptr<Connection> conn, std::string info, Type t)
     pkt.append(info.data(), len);
 
     {
+        // 上锁并给结果队列添加数据
         std::unique_lock<std::mutex> lock(resultMtx);
         resultQueue.push({conn, std::move(pkt)});
     }
     uint64_t one = 1;
+    // 唤醒结果队列
     write(wakeupFd, &one, sizeof(one));
 }
 
@@ -350,14 +350,11 @@ void flushToConn(int epfd, int fd, const std::string &buffer)
     int num = send(fd, buffer.data(), buffer.size(), 0);
     if (num == -1)
     {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        // 非阻塞socket：缓冲区满(EAGAIN) / 被信号打断(EINTR)，都暂存数据，注册写事件等后续发送
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         {
             conn->sendBuf.append(buffer);
             enableWrite(epfd, fd);
-            return;
-        }
-        else if (errno == EINTR)
-        {
             return;
         }
         perror("send");
@@ -366,6 +363,7 @@ void flushToConn(int epfd, int fd, const std::string &buffer)
         connMap.erase(fd);
         return;
     }
+    // 没发完
     if ((size_t)num < buffer.size())
     {
         conn->sendBuf.append(buffer.data() + num, buffer.size() - num);
@@ -440,7 +438,22 @@ void handleRead(int epfd, int fd)
         printf("收到数据： %.*s\n", (int)info.size(), info.data());
         std::weak_ptr<Connection> wconn = conn;
         pool.enqueue([wconn, info, t]()
-                     { worker(wconn, info, t); });
+                     {
+                        // 避免异常向上抛给packaged_task，防止临时future析构触发terminate干掉整个服务
+                        try
+                        {
+                            worker(wconn, info, t);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            // 标准异常，比如runtime_error等
+                            printf("worker异常: %s\n", e.what());   
+                        }
+                        catch (...)
+                        {
+                            // 捕获所有其他异常（原生异常、自定义非std异常）
+                            printf("worker发生未知异常\n");
+                        } });
     }
 }
 

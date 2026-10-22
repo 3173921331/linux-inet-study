@@ -1,1 +1,0 @@
-单 Reactor（主线程 epoll）+ 固定大小业务线程池 + eventfd 回传 + weak_ptr 防 fd 复用的 Linux TCP 服务器

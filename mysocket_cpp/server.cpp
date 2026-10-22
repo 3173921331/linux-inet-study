@@ -1,11 +1,14 @@
-#include "my_socket.h"
+#include "socket_server.h"
 #include <unistd.h>
-#include <sys/epoll.h>
 #include <cstring>
+#include <csignal>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 
 int main()
 {
+    signal(SIGPIPE, SIG_IGN);
     // 初始化套接字
     int lfd = initSocket();
     // 设置监听
@@ -44,6 +47,26 @@ int main()
     ev.data.fd = wakeupFd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, wakeupFd, &ev);
 
+    //
+    int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (timerfd == -1)
+    {
+        perror("timerfd_create");
+        return -1;
+    }
+    itimerspec its{};
+    its.it_interval.tv_sec = 3; // 每 3 秒
+    its.it_value.tv_sec = 3;
+    timerfd_settime(timerfd, 0, &its, nullptr);
+    ev.events = EPOLLIN;
+    ev.data.fd = timerfd;
+    // epoll_ctl(epfd, EPOLL_CTL_ADD, timerfd, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, timerfd, &ev) == -1)
+    {
+        perror("epoll_ctl ADD timerfd");
+        return -1;
+    }
+
     // 创建用于接收epoll输出的events数组
     epoll_event evs[1024];
     int size = sizeof(evs) / sizeof(evs[0]);
@@ -70,17 +93,46 @@ int main()
         {
             int fd = evs[i].data.fd;
             uint32_t events = evs[i].events;
-            if (fd == wakeupFd)
+            if (fd == timerfd)
+            {
+                uint64_t exp;
+                read(timerfd, &exp, sizeof(exp));
+
+                for (auto it = connMap.begin(); it != connMap.end();)
+                {
+                    auto &[cfd, conn] = *it;
+
+                    conn->heartbeatCount++;
+                    printf("fd = %d, count = %d\n", conn->fd, conn->heartbeatCount);
+                    if (conn->heartbeatCount > 5)
+                    {
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+                        close(cfd);
+                        it = connMap.erase(it); // 返回下一个迭代器
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+            }
+            else if (fd == wakeupFd)
             {
                 uint64_t val;
                 // 清空wakeupFd
                 read(wakeupFd, &val, sizeof(val));
                 // 上锁，防止处理数据时被别的线程添加数据
-                std::unique_lock<std::mutex> lock(resultMtx);
-                while (!resultQueue.empty())
+                std::vector<Result> batch;
                 {
-                    Result r = std::move(resultQueue.front());
-                    resultQueue.pop();
+                    std::unique_lock<std::mutex> lock(resultMtx);
+                    while (!resultQueue.empty())
+                    {
+                        batch.push_back(std::move(resultQueue.front()));
+                        resultQueue.pop();
+                    }
+                }
+                for (auto &r : batch)
+                {
                     // r中的conn是weak_ptr，尝试提升成shared_ptr，对象还在就成功
                     auto c = r.conn.lock();
                     if (!c)
@@ -120,6 +172,7 @@ int main()
     close(lfd);
     close(wakeupFd);
     close(epfd);
+    close(timerfd);
 
     return 0;
 }
